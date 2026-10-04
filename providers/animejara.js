@@ -57,14 +57,45 @@ function browserHeaders(referer) {
   if (referer) h["Referer"] = referer;
   return h;
 }
+function chromeHints(h) {
+  h["sec-ch-ua"] = '"Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99"';
+  h["sec-ch-ua-mobile"] = "?1";
+  h["sec-ch-ua-platform"] = '"Android"';
+  return h;
+}
+var COOKIE_JAR = null;
+// Visita la portada para recoger las cookies que el sitio reparte (si el entorno deja leer set-cookie)
+async function primeCookies() {
+  if (COOKIE_JAR !== null) return COOKIE_JAR;
+  COOKIE_JAR = "";
+  try {
+    var resp = await fetch(AJ_BASE + "/", { headers: browserHeaders(null) });
+    var raw = "";
+    try { raw = (resp.headers && resp.headers.get && resp.headers.get("set-cookie")) || ""; } catch (_) { /* no legible */ }
+    var pairs = raw.split(/,(?=\s*[^;,=\s]+=)/).map(function (c) { return c.split(";")[0].trim(); }).filter(function (c) { return c.indexOf("=") > 0; });
+    COOKIE_JAR = pairs.join("; ");
+    trace(COOKIE_JAR ? "cookies: " + pairs.length : "cookies: el sitio no entrego/no se pueden leer (HTTP " + resp.status + ")");
+  } catch (e) {
+    trace("cookies: fallo " + shortErr(e));
+  }
+  return COOKIE_JAR;
+}
 // Pagina de animejara.com: prueba varias formas de pedirla (el sitio responde 404 a algunas peticiones que no parecen un navegador)
-async function fetchPage(url) {
+async function fetchPage(url, referer) {
+  var eh = chromeHints(browserHeaders(referer || AJ_BASE + "/"));
   var variants = [
     { tag: "A", url: url, headers: { "User-Agent": UA, "Referer": AJ_BASE + "/" } },
     { tag: "B", url: url, headers: browserHeaders(AJ_BASE + "/") },
     { tag: "C", url: url.replace("//animejara.com", "//www.animejara.com"), headers: browserHeaders("https://www.animejara.com/") },
-    { tag: "D", url: url, headers: browserHeaders(null) }
+    { tag: "D", url: url, headers: browserHeaders(null) },
+    { tag: "E", url: url, headers: eh }
   ];
+  var jar = await primeCookies();
+  if (jar) {
+    var fh = chromeHints(browserHeaders(referer || AJ_BASE + "/"));
+    fh["Cookie"] = jar;
+    variants.push({ tag: "F", url: url, headers: fh });
+  }
   var notes = [];
   for (var i = 0; i < variants.length; i++) {
     try {
@@ -220,7 +251,7 @@ async function slugCandidates(titles, year, extra) {
 // ---------- pagina del episodio ----------
 async function getEpisode(slug, season, episode) {
   var url = AJ_BASE + "/episode/" + slug + "-" + season + "x" + episode + "/";
-  var html = await fetchPage(url);
+  var html = await fetchPage(url, AJ_BASE + "/anime/" + slug);
   var m = /const\s+enlaces\s*=\s*(\[[\s\S]*?\])\s*;/.exec(html);
   if (!m) throw new Error("sin 'enlaces' (" + html.length + " bytes" + (looksBlocked(html) ? ", CLOUDFLARE" : "") + ")");
   var links;
@@ -422,6 +453,16 @@ async function getStreams(tmdbId, type, season, episode) {
       }
     }
     if (!ep) {
+      // Para el diagnostico: ¿se puede abrir la pagina de la serie? ¿cuantos enlaces de episodio trae?
+      try {
+        var sp = await fetch(AJ_BASE + "/anime/" + slugs[0], { headers: browserHeaders(AJ_BASE + "/") });
+        var sh = sp.ok ? await sp.text() : "";
+        var links = (sh.match(/\/episode\/[a-z0-9\-]+\//gi) || []);
+        var uniq = links.filter(function (l, i) { return links.indexOf(l) === i; });
+        trace("serie /anime/" + slugs[0] + ": HTTP " + sp.status + ", " + sh.length + " bytes, " + uniq.length + " enlaces de episodio" + (uniq[0] ? " (ej. " + uniq[0] + ")" : ""));
+      } catch (e) {
+        trace("serie: fallo " + shortErr(e));
+      }
       trace("episodio no encontrado (slugs: " + slugs.join(",") + ")");
       console.warn("[AnimeJara] No se encontro la pagina del episodio.");
       return diagnostic();
