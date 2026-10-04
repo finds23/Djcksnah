@@ -42,6 +42,45 @@ function slugify(s) {
 function decodeEntities(s) {
   return String(s || "").replace(/&quot;/g, '"').replace(/&#34;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
 }
+var MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; moto g82 5G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36";
+function browserHeaders(referer) {
+  var h = {
+    "User-Agent": MOBILE_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "es-419,es;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": referer ? "same-origin" : "none",
+    "Sec-Fetch-User": "?1"
+  };
+  if (referer) h["Referer"] = referer;
+  return h;
+}
+// Pagina de animejara.com: prueba varias formas de pedirla (el sitio responde 404 a algunas peticiones que no parecen un navegador)
+async function fetchPage(url) {
+  var variants = [
+    { tag: "A", url: url, headers: { "User-Agent": UA, "Referer": AJ_BASE + "/" } },
+    { tag: "B", url: url, headers: browserHeaders(AJ_BASE + "/") },
+    { tag: "C", url: url.replace("//animejara.com", "//www.animejara.com"), headers: browserHeaders("https://www.animejara.com/") },
+    { tag: "D", url: url, headers: browserHeaders(null) }
+  ];
+  var notes = [];
+  for (var i = 0; i < variants.length; i++) {
+    try {
+      var resp = await fetch(variants[i].url, { headers: variants[i].headers });
+      if (resp.ok) {
+        var text = await resp.text();
+        if (notes.length) trace("pagina ok con variante " + variants[i].tag + " (antes: " + notes.join(" ") + ")");
+        return text;
+      }
+      notes.push(variants[i].tag + resp.status);
+    } catch (e) {
+      notes.push(variants[i].tag + "red");
+    }
+  }
+  throw new Error("HTTP " + notes.join(" "));
+}
 async function fetchText(url, headers) {
   var resp = await fetch(url, { headers: Object.assign({ "User-Agent": UA }, headers || {}) });
   if (!resp.ok) throw new Error("HTTP " + resp.status + " en " + url);
@@ -102,7 +141,7 @@ async function searchSlugs(title) {
     try { data = JSON.parse(decodeEntities(m[3])); } catch (e) { /* tarjeta sin datos */ }
     out.push({ slug: m[2], kind: m[1], titulo: data.titulo || "", anio: parseInt(data.anio, 10) || null, tipo: norm(data.tipo || "") });
   }
-  trace("busqueda '" + title + "': " + out.length + " tarjetas, " + html.length + " bytes" + (looksBlocked(html) ? ", CLOUDFLARE" : ""));
+  trace("busqueda '" + title + "': " + out.length + " tarjetas" + (out.length ? " (" + out.map(function (c) { return c.slug; }).join(",").slice(0, 70) + ")" : "") + (looksBlocked(html) ? ", CLOUDFLARE" : ""));
   if (out.length === 0) {
     // Respaldo: cualquier enlace /anime/<slug> (puede incluir barras laterales; se filtra luego por similitud)
     var re = /href=["'](?:https?:\/\/(?:www\.)?animejara\.com)?\/(anime)\/([a-z0-9][a-z0-9\-]*)\/?(?:#[^"']*)?["']/gi;
@@ -144,7 +183,7 @@ async function slugCandidates(titles, year) {
 // ---------- pagina del episodio ----------
 async function getEpisode(slug, season, episode) {
   var url = AJ_BASE + "/episode/" + slug + "-" + season + "x" + episode + "/";
-  var html = await fetchText(url, { "Referer": AJ_BASE + "/" });
+  var html = await fetchPage(url);
   var m = /const\s+enlaces\s*=\s*(\[[\s\S]*?\])\s*;/.exec(html);
   if (!m) throw new Error("sin 'enlaces' (" + html.length + " bytes" + (looksBlocked(html) ? ", CLOUDFLARE" : "") + ")");
   var links;
