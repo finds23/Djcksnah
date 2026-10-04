@@ -463,6 +463,19 @@ async function getStreams(tmdbId, type, season, episode) {
       } catch (e) {
         trace("serie: fallo " + shortErr(e));
       }
+      // Controles: episodios que SI existen (vistos en el navegador) para saber si el problema es el sitio o la ruta del episodio pedido
+      if (DEBUG) {
+        var controls = ["black-clover-1x170", "tokyo-revengers-4x1"];
+        for (var ci = 0; ci < controls.length; ci++) {
+          try {
+            var cr = await fetch(AJ_BASE + "/episode/" + controls[ci] + "/", { headers: browserHeaders(AJ_BASE + "/") });
+            var ct = cr.ok ? await cr.text() : "";
+            trace("control " + controls[ci] + ": HTTP " + cr.status + (cr.ok ? ", " + ct.length + " bytes, enlaces=" + (/const\s+enlaces/.test(ct) ? "si" : "no") : ""));
+          } catch (e) {
+            trace("control " + controls[ci] + ": " + shortErr(e));
+          }
+        }
+      }
       trace("episodio no encontrado (slugs: " + slugs.join(",") + ")");
       console.warn("[AnimeJara] No se encontro la pagina del episodio.");
       return diagnostic();
