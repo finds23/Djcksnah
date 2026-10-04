@@ -21,6 +21,15 @@ var ENABLED_SOURCES = {
   Filemoon: false,   // pendiente: usa un API cifrado
   Upnshare: false    // pendiente
 };
+// Mientras se prueba el plugin: si no se encuentra nada, la lista de Nuvio muestra una entrada "DIAGNOSTICO"
+// con los pasos que se dieron. Poner en false cuando todo funcione.
+var DEBUG = true;
+var TRACE = [];
+function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 140)); }
+function looksBlocked(html) {
+  return /just a moment|cf-chl|challenge-platform|attention required|enable javascript and cookies/i.test(html || "");
+}
+function shortErr(e) { return String(e && e.message || e).replace(/ en https?:\/\/\S+/, ""); }
 var SERVER_ORDER = ["Streamtape", "Mp4upload", "Streamhg", "Voe", "Vidhide", "Lulustream"];
 
 // ---------- utilidades ----------
@@ -93,6 +102,7 @@ async function searchSlugs(title) {
     try { data = JSON.parse(decodeEntities(m[3])); } catch (e) { /* tarjeta sin datos */ }
     out.push({ slug: m[2], kind: m[1], titulo: data.titulo || "", anio: parseInt(data.anio, 10) || null, tipo: norm(data.tipo || "") });
   }
+  trace("busqueda '" + title + "': " + out.length + " tarjetas, " + html.length + " bytes" + (looksBlocked(html) ? ", CLOUDFLARE" : ""));
   if (out.length === 0) {
     // Respaldo: cualquier enlace /anime/<slug> (puede incluir barras laterales; se filtra luego por similitud)
     var re = /href=["'](?:https?:\/\/(?:www\.)?animejara\.com)?\/(anime)\/([a-z0-9][a-z0-9\-]*)\/?(?:#[^"']*)?["']/gi;
@@ -120,6 +130,7 @@ async function slugCandidates(titles, year) {
         if (scored[c.slug] === undefined || score > scored[c.slug]) scored[c.slug] = score;
       });
     } catch (e) {
+      trace("busqueda '" + titles[i] + "' fallo: " + shortErr(e));
       console.warn("[AnimeJara] Busqueda fallo (\"" + titles[i] + "\"): " + e.message);
     }
   }
@@ -135,10 +146,10 @@ async function getEpisode(slug, season, episode) {
   var url = AJ_BASE + "/episode/" + slug + "-" + season + "x" + episode + "/";
   var html = await fetchText(url, { "Referer": AJ_BASE + "/" });
   var m = /const\s+enlaces\s*=\s*(\[[\s\S]*?\])\s*;/.exec(html);
-  if (!m) return null;
+  if (!m) throw new Error("sin 'enlaces' (" + html.length + " bytes" + (looksBlocked(html) ? ", CLOUDFLARE" : "") + ")");
   var links;
-  try { links = JSON.parse(m[1]); } catch (e) { return null; }
-  if (!Array.isArray(links) || links.length === 0) return null;
+  try { links = JSON.parse(m[1]); } catch (e) { throw new Error("enlaces no es JSON"); }
+  if (!Array.isArray(links) || links.length === 0) throw new Error("enlaces vacio");
   // Etiquetas de las pestañas de idioma, en el mismo orden que "enlaces"
   var labels = [], lr = /lang-name["']?>\s*([^<]+?)\s*</gi, lm;
   while ((lm = lr.exec(html)) !== null) labels.push(norm(lm[1]));
@@ -308,14 +319,17 @@ function findSourceKey(serverName) {
 // ---------- punto de entrada ----------
 async function getStreams(tmdbId, type, season, episode) {
   if (!tmdbId || type !== "tv") return [];
+  TRACE = [];
   try {
     var seasonNum = season ? Number(season) : 1;
     var episodeNum = episode !== undefined ? Number(episode) : 1;
     var info = await getTMDBInfo(tmdbId);
-    if (!info) return [];
+    if (!info) { trace("TMDB fallo"); return diagnostic(); }
+    trace("TMDB: " + info.titles.slice(0, 2).join(" / ") + " (" + info.year + ") T" + seasonNum + "E" + episodeNum);
     if (!info.isAnime) {
+      trace("descartado: no parece anime (animacion + pais asiatico)");
       console.log("[AnimeJara] Descartado (no parece anime): " + (info.titles[0] || tmdbId));
-      return [];
+      return diagnostic();
     }
     var slugs = await slugCandidates(info.titles, info.year);
     console.log("[AnimeJara] Candidatos de slug: " + slugs.join(", ") + " | T" + seasonNum + "E" + episodeNum);
@@ -326,13 +340,16 @@ async function getStreams(tmdbId, type, season, episode) {
         ep = await getEpisode(slugs[i], seasonNum, episodeNum);
         if (ep) usedSlug = slugs[i];
       } catch (e) {
+        trace(slugs[i] + ": " + shortErr(e));
         console.log("[AnimeJara] " + slugs[i] + " no sirve: " + e.message);
       }
     }
     if (!ep) {
+      trace("episodio no encontrado (slugs: " + slugs.join(",") + ")");
       console.warn("[AnimeJara] No se encontro la pagina del episodio.");
-      return [];
+      return diagnostic();
     }
+    trace("episodio ok: " + usedSlug + " (" + ep.langs.join("+") + ")");
     console.log("[AnimeJara] Episodio: " + ep.url + " (" + ep.langs.join(", ") + ")");
 
     var results = [];
@@ -342,9 +359,11 @@ async function getStreams(tmdbId, type, season, episode) {
       try {
         servers = await getServers(ep.links[li], ep.url);
       } catch (e) {
+        trace("reproductor " + lang + " fallo: " + shortErr(e));
         console.warn("[AnimeJara] No se pudo leer el reproductor (" + lang + "): " + e.message);
         continue;
       }
+      trace(lang + ": " + servers.length + " servidores" + (servers.length ? " (" + servers.map(function (x) { return x.name; }).join(",") + ")" : ""));
       console.log("[AnimeJara] " + lang + " servidores: " + servers.map(function (s) { return s.name; }).join(", "));
       var jobs = servers.map(async function (server) {
         var key = findSourceKey(server.name);
@@ -368,6 +387,7 @@ async function getStreams(tmdbId, type, season, episode) {
             return o;
           });
         } catch (e) {
+          trace(source.label + " (" + lang + ") fallo: " + shortErr(e));
           console.warn("[" + source.label + "] fallo: " + e.message);
           return null;
         }
@@ -381,11 +401,25 @@ async function getStreams(tmdbId, type, season, episode) {
     });
     results.forEach(function (r) { delete r._lang; delete r._rank; });
     console.log("[AnimeJara] " + results.length + " streams");
+    if (results.length === 0) return diagnostic();
     return results;
   } catch (e) {
+    trace("error: " + shortErr(e));
     console.error("[AnimeJara] Error: " + e.message);
-    return [];
+    return diagnostic();
   }
+}
+
+// Entrada informativa (no reproducible) para ver en la lista de Nuvio por que no salio nada
+function diagnostic() {
+  if (!DEBUG) return [];
+  return [{
+    name: "AnimeJara",
+    title: "",
+    url: AJ_BASE + "/",
+    quality: "\uD83D\uDEE0 DIAGNOSTICO (no reproducir)\n" + TRACE.join("\n"),
+    headers: {}
+  }];
 }
 
 exports.getStreams = getStreams;
