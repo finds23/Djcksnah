@@ -113,9 +113,16 @@ async function getTMDBInfo(tmdbId) {
 
 // ---------- slug de la serie ----------
 var STOP = ["the", "a", "an", "of", "and", "no", "wa", "wo", "ni", "to", "ga", "de", "la", "el", "los", "las", "y", "en", "del"];
+function stripSeasonWords(s) {
+  return String(s || "")
+    .replace(/\b\d{1,2}(?:st|nd|rd|th)\s+season\b/gi, " ")
+    .replace(/\bseason\s*\d{1,2}\b/gi, " ")
+    .replace(/\btemporada\s*\d{1,2}\b/gi, " ")
+    .replace(/\bpart\s*\d{1,2}\b/gi, " ");
+}
 function tokens(s) {
   var seen = {}, out = [];
-  slugify(s).split("-").forEach(function (w) {
+  slugify(stripSeasonWords(s)).split("-").forEach(function (w) {
     if (w && STOP.indexOf(w) === -1 && !seen[w]) { seen[w] = true; out.push(w); }
   });
   return out;
@@ -128,6 +135,32 @@ function similarity(a, b) {
   B.forEach(function (w) { setB[w] = true; });
   var inter = A.filter(function (w) { return setB[w]; }).length;
   return 2 * inter / (A.length + B.length);
+}
+// AniList da el titulo romaji / ingles / sinonimos; animejara suele usar el romaji (ej. "Mushoku Tensei: Isekai Ittara Honki Dasu")
+async function getExtraTitles(titles) {
+  try {
+    var query = "query ($search: String) { Page(page: 1, perPage: 6) { media(search: $search, type: ANIME, sort: SEARCH_MATCH) { title { romaji english } synonyms } } }";
+    var resp = await fetch("https://graphql.anilist.co", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ query: query, variables: { search: titles[0] } })
+    });
+    if (!resp.ok) return [];
+    var json = await resp.json();
+    var media = (json && json.data && json.data.Page && json.data.Page.media) || [];
+    var out = [];
+    media.forEach(function (m) {
+      var names = [m.title.romaji, m.title.english].concat(m.synonyms || []).filter(Boolean);
+      // solo se usan las entradas de AniList que realmente se parecen a la serie buscada
+      var related = names.some(function (n) { return titles.some(function (t) { return similarity(n, t) >= 0.5; }); });
+      if (!related) return;
+      names.forEach(function (n) { if (slugify(n).length >= 2 && out.indexOf(n) === -1) out.push(n); });
+    });
+    return out.slice(0, 12);
+  } catch (e) {
+    trace("AniList fallo: " + shortErr(e));
+    return [];
+  }
 }
 async function searchSlugs(title) {
   var html = await fetchText(AJ_BASE + "/catalogo/?q=" + encodeURIComponent(title), { "Referer": AJ_BASE + "/" });
@@ -151,32 +184,36 @@ async function searchSlugs(title) {
   }
   return out;
 }
-async function slugCandidates(titles, year) {
+async function slugCandidates(titles, year, extra) {
+  var matchTitles = titles.concat(extra || []);
+  var queries = titles.slice(0, 2).concat((extra || []).slice(0, 2));
   var scored = {};
-  for (var i = 0; i < titles.length && i < 3; i++) {
+  for (var i = 0; i < queries.length; i++) {
     try {
-      var cards = await searchSlugs(titles[i]);
+      var cards = await searchSlugs(queries[i]);
       cards.forEach(function (c) {
         if (c.kind !== "anime") return; // las peliculas viven en /movie/
         var best = 0;
-        titles.forEach(function (t) {
+        matchTitles.forEach(function (t) {
           best = Math.max(best, similarity((c.titulo || c.slug.replace(/-/g, " ")), t));
         });
-        if (best < 0.7) return; // evita series distintas con una palabra en comun (Tokyo Ghoul / Tokyo Revengers)
-        var score = best;
-        if (year && c.anio && Math.abs(year - c.anio) <= 1) score += 0.05;
-        if (c.tipo === "tv") score += 0.03;
+        var yearMatch = !!(year && c.anio && year === c.anio);
+        var accepted = best >= 0.7 || (yearMatch && best >= 0.4 && (c.tipo === "tv" || c.tipo === ""));
+        if (!accepted) return;
+        var score = best + (yearMatch ? 0.05 : 0) + (c.tipo === "tv" ? 0.03 : 0);
         if (scored[c.slug] === undefined || score > scored[c.slug]) scored[c.slug] = score;
       });
     } catch (e) {
-      trace("busqueda '" + titles[i] + "' fallo: " + shortErr(e));
-      console.warn("[AnimeJara] Busqueda fallo (\"" + titles[i] + "\"): " + e.message);
+      trace("busqueda '" + queries[i] + "' fallo: " + shortErr(e));
+      console.warn("[AnimeJara] Busqueda fallo (\"" + queries[i] + "\"): " + e.message);
     }
+    if (Object.keys(scored).length >= 1 && i >= 1) break; // ya hay candidatos fiables
   }
   var fromSearch = Object.keys(scored).sort(function (a, b) { return scored[b] - scored[a]; });
+  trace("candidatos: " + (fromSearch.length ? fromSearch.map(function (k) { return k + "(" + scored[k].toFixed(2) + ")"; }).join(",") : "ninguno de la busqueda"));
   var guessed = titles.map(slugify).filter(Boolean);
   var all = [];
-  fromSearch.concat(guessed).forEach(function (s) { if (all.indexOf(s) === -1) all.push(s); });
+  fromSearch.concat(guessed).forEach(function (sl) { if (all.indexOf(sl) === -1) all.push(sl); });
   return all.slice(0, 5);
 }
 
@@ -370,7 +407,8 @@ async function getStreams(tmdbId, type, season, episode) {
       console.log("[AnimeJara] Descartado (no parece anime): " + (info.titles[0] || tmdbId));
       return diagnostic();
     }
-    var slugs = await slugCandidates(info.titles, info.year);
+    var extra = await getExtraTitles(info.titles);
+    var slugs = await slugCandidates(info.titles, info.year, extra);
     console.log("[AnimeJara] Candidatos de slug: " + slugs.join(", ") + " | T" + seasonNum + "E" + episodeNum);
 
     var ep = null, usedSlug = null;
