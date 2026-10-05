@@ -1,12 +1,12 @@
 {
   "name": "AnimeJara",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "scrapers": [
     {
       "id": "AnimeJara",
       "name": "AnimeJara",
       "description": "Streams de anime (Latino y Japonés) desde AnimeJara vía Streamtape, MP4Upload, StreamHG y más.",
-      "version": "1.0.7",
+      "version": "1.0.8",
       "author": "-",
       "supportedTypes": ["tv"],
       "filename": "providers/animejara.js",
