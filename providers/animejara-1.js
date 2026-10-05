@@ -26,7 +26,7 @@ var ENABLED_SOURCES = {
 };
 // Mientras se prueba el plugin: si no se encuentra nada, la lista de Nuvio muestra una entrada "DIAGNOSTICO"
 // con los pasos que se dieron. Poner en false cuando todo funcione.
-var VERSION = "1.4.0"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
+var VERSION = "1.4.1"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
 var DEBUG = true;
 var TRACE = [];
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 140)); }
@@ -382,6 +382,40 @@ function findJsRedirect(html, baseUrl) {
   return null;
 }
 function hostOf(u) { try { return new URL(u).host; } catch (e) { return "?"; } }
+var MAINJS_DONE = false;
+// Diagnostico: la pagina del embed es un cascaron que carga un script; se resume ese script para ver de donde sale el video
+async function traceMainJs(html, pageUrl, embedUrl) {
+  if (MAINJS_DONE) return;
+  MAINJS_DONE = true;
+  try {
+    var path = "?";
+    try { var u = new URL(embedUrl); path = u.pathname + (u.search || ""); } catch (e) { /* sin ruta */ }
+    trace("embed ruta: " + path.slice(0, 100));
+    var sm = /<script[^>]+src=["']([^"']+)["']/i.exec(html);
+    if (!sm) { trace("main.js: la pagina no trae script"); return; }
+    var jsUrl = new URL(sm[1].replace(/&amp;/g, "&"), pageUrl).href;
+    var resp = await fetch(jsUrl, { headers: { "User-Agent": UA, "Referer": pageUrl } });
+    var js = await resp.text();
+    trace("main.js: HTTP " + resp.status + ", " + js.length + " bytes");
+    var flags = ["fetch(", "XMLHttpRequest", "atob(", "CryptoJS", "AES", "decrypt", "eval(", "Function(", "m3u8", "localStorage", "cookie", "window.location", "turnstile", "captcha"]
+      .filter(function (f) { return js.indexOf(f) !== -1; });
+    trace("main.js usa: " + (flags.join(" ") || "nada de lo habitual"));
+    var seen = {}, urls = [], um;
+    var ure = /["'`]((?:https?:)?\/[a-zA-Z0-9_\-\/\.\?=&:%]{3,80})["'`]/g;
+    while ((um = ure.exec(js)) !== null && urls.length < 8) {
+      var v = um[1];
+      if (/\.(?:css|png|jpe?g|svg|gif|woff2?|ico)(?:\?|$)/i.test(v) || seen[v]) continue;
+      seen[v] = true; urls.push(v);
+    }
+    trace("main.js rutas: " + urls.join(" ").slice(0, 135));
+    var fm = [], fre = /fetch\(\s*([^)]{1,90})\)/g, fx;
+    while ((fx = fre.exec(js)) !== null && fm.length < 3) fm.push(fx[1].replace(/\s+/g, " "));
+    fm.forEach(function (x, i) { trace("main.js fetch" + (i + 1) + ": " + x.slice(0, 120)); });
+    trace("main.js inicio: " + js.slice(0, 130).replace(/\s+/g, " "));
+  } catch (e) {
+    trace("main.js fallo: " + shortErr(e));
+  }
+}
 async function extractPackedHls(embedUrl, ctx) {
   var referer = (ctx && ctx.referer) || AJ_BASE + "/";
   var pageUrl = embedUrl, html = "", url = null;
@@ -407,6 +441,7 @@ async function extractPackedHls(embedUrl, ctx) {
       trace("cuerpo: " + flat.slice(0, 130));
       trace("cuerpo2: " + flat.slice(130, 260));
       trace("cuerpo3: " + flat.slice(260, 390));
+      if (DEBUG) await traceMainJs(html, pageUrl, embedUrl);
     }
     throw new Error("No se encontro la URL HLS en el embed");
   }
@@ -604,6 +639,7 @@ function findSourceKey(serverName) {
 async function getStreams(tmdbId, type, season, episode) {
   if (!tmdbId || type !== "tv") return [];
   TRACE = [];
+  MAINJS_DONE = false;
   trace("AnimeJara v" + VERSION);
   try {
     var seasonNum = season ? Number(season) : 1;
