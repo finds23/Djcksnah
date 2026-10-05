@@ -18,12 +18,13 @@ var ENABLED_SOURCES = {
   Voe: true,         // portado de Latanime; sin confirmar que reproduce
   Vidhide: true,     // sin probar (mismo extractor que Streamhg)
   Lulustream: true,  // sin probar (mismo extractor que Streamhg)
+  Uqload: true,      // sin probar
   Filemoon: false,   // pendiente: usa un API cifrado
   Upnshare: false    // pendiente
 };
 // Mientras se prueba el plugin: si no se encuentra nada, la lista de Nuvio muestra una entrada "DIAGNOSTICO"
 // con los pasos que se dieron. Poner en false cuando todo funcione.
-var VERSION = "1.1.0"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
+var VERSION = "1.2.0"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
 var DEBUG = true;
 var TRACE = [];
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 140)); }
@@ -31,7 +32,7 @@ function looksBlocked(html) {
   return /just a moment|cf-chl|challenge-platform|attention required|enable javascript and cookies/i.test(html || "");
 }
 function shortErr(e) { return String(e && e.message || e).replace(/ en https?:\/\/\S+/, ""); }
-var SERVER_ORDER = ["Streamtape", "Mp4upload", "Streamhg", "Voe", "Vidhide", "Lulustream"];
+var SERVER_ORDER = ["Streamtape", "Mp4upload", "Streamhg", "Voe", "Vidhide", "Lulustream", "Uqload"];
 
 // ---------- utilidades ----------
 function norm(s) {
@@ -303,33 +304,62 @@ async function getServers(embedPageUrl, referer) {
 }
 
 // ---------- extractores ----------
+function packEnc(c, a) {
+  return (c < a ? "" : packEnc(parseInt(c / a, 10), a)) + ((c = c % a) > 35 ? String.fromCharCode(c + 29) : c.toString(36));
+}
+// Desempaqueta eval(function(p,a,c,k,e,d){...}) de Dean Edwards (soporta base 2-62; toString(62) no existe en JS)
 function unpackPacker(src) {
-  var m = /\}\('([\s\S]*?)',\s*(\d+),\s*(\d+),\s*'([\s\S]*?)'\.split\('\|'\)/.exec(src);
+  var m = /\}\(\s*(['"])((?:\\[\s\S]|(?!\1)[^\\])*)\1\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(['"])((?:\\[\s\S]|(?!\5)[^\\])*)\5\s*\.split\(\s*['"]\|['"]\s*\)/.exec(src);
   if (!m) return null;
-  var p = m[1].replace(/\\'/g, "'").replace(/\\\\/g, "\\");
-  var radix = parseInt(m[2], 10), count = parseInt(m[3], 10), dict = m[4].split("|");
-  while (count--) {
-    if (dict[count]) p = p.replace(new RegExp("\\b" + count.toString(radix) + "\\b", "g"), dict[count]);
+  var p = m[2].replace(/\\(['"\\\/])/g, "$1");
+  var radix = parseInt(m[3], 10), count = parseInt(m[4], 10), dict = m[6].split("|");
+  var map = {};
+  for (var c = count - 1; c >= 0; c--) {
+    var key = packEnc(c, radix);
+    map[key] = dict[c] || key;
   }
-  return p;
+  return p.replace(/\b\w+\b/g, function (w) { return Object.prototype.hasOwnProperty.call(map, w) ? map[w] : w; });
+}
+function describeHtml(html) {
+  var t = /<title[^>]*>([^<]*)/i.exec(html || "");
+  return (html || "").length + "b" +
+    ", packer=" + (/eval\(function\(p,a,c,k,e,d\)/.test(html) ? "si" : "no") +
+    ", m3u8=" + (/m3u8/.test(html) ? "si" : "no") +
+    ", links=" + (/var\s+links\s*=/.test(html) ? "si" : "no") +
+    ", sources=" + (/sources\s*:/.test(html) ? "si" : "no") +
+    (looksBlocked(html) ? ", CLOUDFLARE" : "") +
+    ", titulo=" + (t ? t[1].trim().slice(0, 30) : "?");
 }
 function extractHlsFromHtml(html) {
   var texts = [html];
-  var re = /eval\(function\(p,a,c,k,e,d\)[\s\S]*?\.split\('\|'\)[^\n]*?\)\)/g, m;
+  var re = /eval\(function\(p,a,c,k,e,d\)[\s\S]*?\.split\(\s*['"]\|['"]\s*\)[^\n]*?\)\)/g, m;
   while ((m = re.exec(html)) !== null) {
-    try { var u = unpackPacker(m[0]); if (u) texts.unshift(u); } catch (e) { /* siguiente */ }
+    try {
+      var u = unpackPacker(m[0]);
+      if (u) texts.unshift(u);
+      else trace("packer: no se pudo leer");
+    } catch (e) { trace("packer error: " + shortErr(e)); }
   }
   for (var i = 0; i < texts.length; i++) {
     var lm = /var\s+links\s*=\s*(\{[\s\S]*?\})\s*;/.exec(texts[i]);
     if (lm) {
       try {
         var links = JSON.parse(lm[1]);
-        var best = links.hls2 || links.hls4 || links.hls3;
+        var best = links.hls4 || links.hls2 || links.hls3 || links.hls1 || links.hls;
+        if (!best) {
+          Object.keys(links).forEach(function (k) { if (!best && /\.m3u8/.test(String(links[k]))) best = links[k]; });
+        }
         if (best) return best;
       } catch (e) { /* seguir */ }
     }
+    var jm = /["']hls\d?["']\s*:\s*["']([^"']+)["']/.exec(texts[i]);
+    if (jm) return jm[1].replace(/\\\//g, "/");
     var fm = /https?:\/\/[^"'\s\\]+\.m3u8[^"'\s\\]*/.exec(texts[i]);
     if (fm) return fm[0];
+    var fl = /file\s*:\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/.exec(texts[i]);
+    if (fl) return fl[1];
+    var rel = /["'](\/[^"'\s\\]+\.m3u8[^"'\s\\]*)["']/.exec(texts[i]);
+    if (rel) return rel[1];
   }
   return null;
 }
@@ -338,9 +368,16 @@ async function extractPackedHls(embedUrl, ctx) {
   if (!resp.ok) throw new Error("HTTP " + resp.status + " en " + embedUrl);
   var html = await resp.text();
   var url = extractHlsFromHtml(html);
-  if (!url) throw new Error("No se encontro la URL HLS en el embed");
   var origin;
   try { origin = new URL(resp.url || embedUrl).origin; } catch (e) { origin = "https://hgcloud.to"; }
+  if (!url) {
+    var host = ""; try { host = new URL(embedUrl).host; } catch (e) { /* sin host */ }
+    trace("embed " + host + ": " + describeHtml(html));
+    throw new Error("No se encontro la URL HLS en el embed");
+  }
+  url = String(url).replace(/\\\//g, "/");
+  if (url.indexOf("//") === 0) url = "https:" + url;
+  else if (url.charAt(0) === "/") url = origin + url;
   return { url: url, type: "hls", headers: { "Referer": origin + "/", "Origin": origin, "User-Agent": UA } };
 }
 async function extractVidhide(embedUrl, ctx) {
@@ -366,7 +403,7 @@ function extractStreamtapeFromHtml(html) {
 async function extractStreamtape(embedUrl, ctx) {
   var html = await fetchText(embedUrl, { "Referer": (ctx && ctx.referer) || AJ_BASE + "/" });
   var url = extractStreamtapeFromHtml(html);
-  if (!url) throw new Error("No se encontro el enlace en el embed de Streamtape");
+  if (!url) { trace("embed streamtape: " + describeHtml(html) + ", robotlink=" + (/robotlink|botlink/.test(html) ? "si" : "no")); throw new Error("No se encontro el enlace en el embed de Streamtape"); }
   return { url: url, headers: { "Referer": "https://streamtape.com/", "User-Agent": UA } };
 }
 
@@ -433,13 +470,26 @@ async function extractVoe(embedUrl, ctx) {
   return out;
 }
 
+async function extractUqload(embedUrl, ctx) {
+  var html = await fetchText(embedUrl, { "Referer": (ctx && ctx.referer) || AJ_BASE + "/" });
+  var m = /sources\s*:\s*\[\s*["']([^"']+)["']/.exec(html) || /file\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/.exec(html);
+  if (!m) { trace("embed uqload: " + describeHtml(html)); throw new Error("No se encontro la fuente en Uqload"); }
+  var origin = new URL(embedUrl).origin;
+  var v = m[1];
+  if (v.indexOf("//") === 0) v = "https:" + v;
+  var o = { url: v, headers: { "Referer": origin + "/", "User-Agent": UA } };
+  if (/\.m3u8/.test(v)) o.type = "hls";
+  return o;
+}
+
 var EXTRACTORS = {
   Streamtape: { label: "Streamtape", extract: extractStreamtape },
   Mp4upload: { label: "MP4Upload", extract: extractMp4upload },
   Streamhg: { label: "StreamHG", extract: extractPackedHls },
   Voe: { label: "VOE", extract: extractVoe },
   Vidhide: { label: "Vidhide", extract: extractVidhide },
-  Lulustream: { label: "Lulustream", extract: extractPackedHls }
+  Lulustream: { label: "Lulustream", extract: extractPackedHls },
+  Uqload: { label: "Uqload", extract: extractUqload }
 };
 function findSourceKey(serverName) {
   var n = norm(serverName);
@@ -569,6 +619,7 @@ async function getStreams(tmdbId, type, season, episode) {
     results.forEach(function (r) { delete r._lang; delete r._rank; });
     console.log("[AnimeJara] " + results.length + " streams");
     if (results.length === 0) return diagnostic();
+    if (DEBUG && TRACE.some(function (t) { return /fallo/.test(t); })) results = results.concat(diagnostic());
     return results;
   } catch (e) {
     trace("error: " + shortErr(e));
