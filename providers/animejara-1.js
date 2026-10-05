@@ -23,7 +23,7 @@ var ENABLED_SOURCES = {
 };
 // Mientras se prueba el plugin: si no se encuentra nada, la lista de Nuvio muestra una entrada "DIAGNOSTICO"
 // con los pasos que se dieron. Poner en false cuando todo funcione.
-var VERSION = "1.0.9"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
+var VERSION = "1.1.0"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
 var DEBUG = true;
 var TRACE = [];
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 140)); }
@@ -217,6 +217,8 @@ async function searchSlugs(title) {
     try { data = JSON.parse(decodeEntities(m[3])); } catch (e) { /* tarjeta sin datos */ }
     out.push({ slug: m[2], kind: m[1], titulo: data.titulo || "", anio: parseInt(data.anio, 10) || null, tipo: norm(data.tipo || "") });
   }
+  var tt0 = /<title[^>]*>([^<]*)/i.exec(html);
+  trace("busqueda html: " + html.length + " bytes, titulo=" + (tt0 ? tt0[1].trim().slice(0, 40) : "?") + ", anime-card=" + ((html.match(/anime-card/g) || []).length));
   trace("busqueda '" + title + "': " + out.length + " tarjetas" + (out.length ? " (" + out.map(function (c) { return c.slug; }).join(",").slice(0, 70) + ")" : "") + (looksBlocked(html) ? ", CLOUDFLARE" : ""));
   if (out.length === 0) {
     // Respaldo: cualquier enlace /anime/<slug> (puede incluir barras laterales; se filtra luego por similitud)
@@ -255,9 +257,18 @@ async function slugCandidates(titles, year, extra) {
   var fromSearch = Object.keys(scored).sort(function (a, b) { return scored[b] - scored[a]; });
   trace("candidatos: " + (fromSearch.length ? fromSearch.map(function (k) { return k + "(" + scored[k].toFixed(2) + ")"; }).join(",") : "ninguno de la busqueda"));
   var guessed = titles.map(slugify).filter(Boolean);
+  // animejara suele usar el titulo romaji (ej. "sousou-no-frieren"): se prueban tambien los titulos de AniList
+  var guessedExtra = [];
+  (extra || []).forEach(function (t) {
+    var full = slugify(t);
+    var short = slugify(String(t).split(":")[0]); // sin subtitulo
+    [short, full].forEach(function (sl) {
+      if (sl && sl.length >= 8 && guessedExtra.indexOf(sl) === -1) guessedExtra.push(sl);
+    });
+  });
   var all = [];
-  fromSearch.concat(guessed).forEach(function (sl) { if (all.indexOf(sl) === -1) all.push(sl); });
-  return all.slice(0, 5);
+  fromSearch.concat(guessed, guessedExtra).forEach(function (sl) { if (all.indexOf(sl) === -1) all.push(sl); });
+  return all.slice(0, 8);
 }
 
 // ---------- pagina del episodio ----------
