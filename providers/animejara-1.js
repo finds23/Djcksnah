@@ -19,12 +19,14 @@ var ENABLED_SOURCES = {
   Vidhide: true,     // sin probar (mismo extractor que Streamhg)
   Lulustream: true,  // sin probar (mismo extractor que Streamhg)
   Uqload: true,      // sin probar
+  Yourupload: true,  // sin probar
+  Okru: true,        // sin probar
   Filemoon: false,   // pendiente: usa un API cifrado
   Upnshare: false    // pendiente
 };
 // Mientras se prueba el plugin: si no se encuentra nada, la lista de Nuvio muestra una entrada "DIAGNOSTICO"
 // con los pasos que se dieron. Poner en false cuando todo funcione.
-var VERSION = "1.2.0"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
+var VERSION = "1.4.0"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
 var DEBUG = true;
 var TRACE = [];
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 140)); }
@@ -32,7 +34,7 @@ function looksBlocked(html) {
   return /just a moment|cf-chl|challenge-platform|attention required|enable javascript and cookies/i.test(html || "");
 }
 function shortErr(e) { return String(e && e.message || e).replace(/ en https?:\/\/\S+/, ""); }
-var SERVER_ORDER = ["Streamtape", "Mp4upload", "Streamhg", "Voe", "Vidhide", "Lulustream", "Uqload"];
+var SERVER_ORDER = ["Streamtape", "Mp4upload", "Streamhg", "Voe", "Vidhide", "Lulustream", "Uqload", "Yourupload", "Okru"];
 
 // ---------- utilidades ----------
 function norm(s) {
@@ -363,16 +365,49 @@ function extractHlsFromHtml(html) {
   }
   return null;
 }
+// Redireccion por JS / meta refresh / iframe en paginas "Loading..."
+function findJsRedirect(html, baseUrl) {
+  var pats = [
+    /(?:window\.|document\.|top\.|self\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']/i,
+    /location\.(?:replace|assign)\(\s*["']([^"']+)["']\s*\)/i,
+    /<meta[^>]+http-equiv=["']?refresh["']?[^>]+url=\s*["']?([^"'>\s]+)/i,
+    /<iframe[^>]+src=["']([^"']+)["']/i
+  ];
+  for (var i = 0; i < pats.length; i++) {
+    var m = pats[i].exec(html);
+    if (m) {
+      try { return new URL(m[1].replace(/&amp;/g, "&").replace(/\\\//g, "/"), baseUrl).href; } catch (e) { /* siguiente */ }
+    }
+  }
+  return null;
+}
+function hostOf(u) { try { return new URL(u).host; } catch (e) { return "?"; } }
 async function extractPackedHls(embedUrl, ctx) {
-  var resp = await fetch(embedUrl, { headers: { "User-Agent": UA, "Referer": (ctx && ctx.referer) || AJ_BASE + "/" } });
-  if (!resp.ok) throw new Error("HTTP " + resp.status + " en " + embedUrl);
-  var html = await resp.text();
-  var url = extractHlsFromHtml(html);
+  var referer = (ctx && ctx.referer) || AJ_BASE + "/";
+  var pageUrl = embedUrl, html = "", url = null;
+  for (var hop = 0; hop < 4; hop++) {
+    var resp = await fetch(pageUrl, { headers: { "User-Agent": UA, "Referer": referer } });
+    if (!resp.ok) throw new Error("HTTP " + resp.status + " en " + pageUrl);
+    html = await resp.text();
+    pageUrl = resp.url || pageUrl;
+    url = extractHlsFromHtml(html);
+    if (url) break;
+    var next = findJsRedirect(html, pageUrl);
+    if (!next || next === pageUrl) break;
+    trace("embed " + hostOf(pageUrl) + " redirige a " + hostOf(next));
+    referer = pageUrl;
+    pageUrl = next;
+  }
   var origin;
-  try { origin = new URL(resp.url || embedUrl).origin; } catch (e) { origin = "https://hgcloud.to"; }
+  try { origin = new URL(pageUrl).origin; } catch (e) { origin = "https://hgcloud.to"; }
   if (!url) {
-    var host = ""; try { host = new URL(embedUrl).host; } catch (e) { /* sin host */ }
-    trace("embed " + host + ": " + describeHtml(html));
+    trace("embed " + hostOf(pageUrl) + ": " + describeHtml(html));
+    if (html.length < 3000) {
+      var flat = html.replace(/\s+/g, " ");
+      trace("cuerpo: " + flat.slice(0, 130));
+      trace("cuerpo2: " + flat.slice(130, 260));
+      trace("cuerpo3: " + flat.slice(260, 390));
+    }
     throw new Error("No se encontro la URL HLS en el embed");
   }
   url = String(url).replace(/\\\//g, "/");
@@ -482,6 +517,73 @@ async function extractUqload(embedUrl, ctx) {
   return o;
 }
 
+// YourUpload: la pagina del embed trae el MP4 en el jwplayer (file: '...') o en og:video
+function parseYourupload(html) {
+  var pats = [
+    /file\s*:\s*["']([^"']+)["']/i,
+    /property=["']og:video["'][^>]*content=["']([^"']+)["']/i,
+    /content=["']([^"']+)["'][^>]*property=["']og:video["']/i,
+    /<source[^>]+src=["']([^"']+)["']/i
+  ];
+  for (var i = 0; i < pats.length; i++) {
+    var m = pats[i].exec(html);
+    if (m && /^(https?:)?\/\//i.test(m[1]) && !/\.(?:jpg|jpeg|png|gif|webp)(?:\?|$)/i.test(m[1])) return m[1].replace(/&amp;/g, "&");
+  }
+  return null;
+}
+async function extractYourupload(embedUrl, ctx) {
+  var html = await fetchText(embedUrl, { "Referer": (ctx && ctx.referer) || AJ_BASE + "/" });
+  var v = parseYourupload(html);
+  if (!v) { trace("embed yourupload: " + describeHtml(html)); throw new Error("No se encontro el MP4 en YourUpload"); }
+  if (v.indexOf("//") === 0) v = "https:" + v;
+  return { url: v, headers: { "Referer": "https://www.yourupload.com/", "User-Agent": UA } };
+}
+
+// Okru (ok.ru): el atributo data-options trae un JSON con "metadata" (otro JSON en texto) con hlsManifestUrl y videos[]
+function okDecode(s) {
+  return String(s || "").replace(/&quot;/g, '"').replace(/&#34;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+var OK_QUALITY = ["mobile", "lowest", "low", "sd", "hd", "full", "quad", "ultra"];
+function parseOkru(html) {
+  var m = /data-options=(["'])([\s\S]*?)\1/.exec(html);
+  var meta = null;
+  if (m) {
+    try {
+      var opts = JSON.parse(okDecode(m[2]));
+      var raw = opts && opts.flashvars && opts.flashvars.metadata;
+      meta = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (!meta && opts && opts.flashvars && opts.flashvars.metadataUrl) return { metadataUrl: opts.flashvars.metadataUrl };
+    } catch (e) { /* se prueba con regex */ }
+  }
+  var out = [];
+  if (meta) {
+    var hls = meta.hlsManifestUrl || meta.hlsMasterPlaylistUrl || meta.ondemandHls;
+    if (hls) out.push({ url: hls, type: "hls", tag: "HLS" });
+    var vids = (meta.videos || []).filter(function (v) { return v && v.url; });
+    vids.sort(function (a, b) { return OK_QUALITY.indexOf(b.name) - OK_QUALITY.indexOf(a.name); });
+    if (vids[0]) out.push({ url: vids[0].url, tag: "MP4 " + vids[0].name });
+    return { streams: out };
+  }
+  var txt = okDecode(html).replace(/\\u0026/g, "&").replace(/\\\//g, "/");
+  var hm = /"hlsManifestUrl"\s*:\s*"([^"]+)"/.exec(txt) || /"ondemandHls"\s*:\s*"([^"]+)"/.exec(txt);
+  if (hm) out.push({ url: hm[1], type: "hls", tag: "HLS" });
+  return { streams: out };
+}
+async function extractOkru(embedUrl, ctx) {
+  if (embedUrl.indexOf("//") === 0) embedUrl = "https:" + embedUrl;
+  var html = await fetchText(embedUrl, { "Referer": (ctx && ctx.referer) || AJ_BASE + "/" });
+  var r = parseOkru(html);
+  if (!r.streams || !r.streams.length) {
+    trace("embed okru: " + describeHtml(html) + ", data-options=" + (/data-options=/.test(html) ? "si" : "no"));
+    throw new Error("No se encontro el video en Okru");
+  }
+  return r.streams.map(function (v) {
+    var o = { url: v.url, tag: v.tag, headers: { "Referer": "https://ok.ru/", "User-Agent": UA } };
+    if (v.type) o.type = v.type;
+    return o;
+  });
+}
+
 var EXTRACTORS = {
   Streamtape: { label: "Streamtape", extract: extractStreamtape },
   Mp4upload: { label: "MP4Upload", extract: extractMp4upload },
@@ -489,10 +591,12 @@ var EXTRACTORS = {
   Voe: { label: "VOE", extract: extractVoe },
   Vidhide: { label: "Vidhide", extract: extractVidhide },
   Lulustream: { label: "Lulustream", extract: extractPackedHls },
-  Uqload: { label: "Uqload", extract: extractUqload }
+  Uqload: { label: "Uqload", extract: extractUqload },
+  Yourupload: { label: "YourUpload", extract: extractYourupload },
+  Okru: { label: "Okru", extract: extractOkru }
 };
 function findSourceKey(serverName) {
-  var n = norm(serverName);
+  var n = norm(serverName).replace(/[^a-z0-9]/g, ""); // "ok.ru" -> "okru"
   return Object.keys(EXTRACTORS).filter(function (k) { return ENABLED_SOURCES[k]; }).find(function (k) { return n.indexOf(k.toLowerCase()) !== -1; });
 }
 
