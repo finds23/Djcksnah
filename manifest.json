@@ -9,7 +9,7 @@
       "version": "1.0.9",
       "author": "-",
       "supportedTypes": ["tv"],
-      "filename": "providers/animejara.js",
+      "filename": "providers/animejara-1.js",
       "enabled": true,
       "contentLanguage": ["es", "ja"]
     }
