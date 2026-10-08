@@ -26,8 +26,8 @@ var ENABLED_SOURCES = {
 };
 // Mientras se prueba el plugin: si no se encuentra nada, la lista de Nuvio muestra una entrada "DIAGNOSTICO"
 // con los pasos que se dieron. Poner en false cuando todo funcione.
-var VERSION = "1.4.1"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
-var DEBUG = true;
+var VERSION = "1.4.2"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
+var DEBUG = false;
 var TRACE = [];
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 140)); }
 function looksBlocked(html) {
@@ -552,9 +552,15 @@ async function extractUqload(embedUrl, ctx) {
   return o;
 }
 
-// YourUpload: la pagina del embed trae el MP4 en el jwplayer (file: '...') o en og:video
+// YourUpload: la pagina del embed trae el MP4 en el jwplayer (file: '...') o en og:video.
+// Primero los patrones de AMOKIN (exigen .mp4); despues los genericos de antes.
+function cleanMediaUrl(u) {
+  return String(u || "").replace(/\\u0026/gi, "&").replace(/\\\//g, "/").replace(/&amp;/gi, "&").trim();
+}
 function parseYourupload(html) {
   var pats = [
+    /(?:file|src)\s*:\s*["'](https?:\\?\/\\?\/[^"']+?\.mp4[^"']*)["']/i,
+    /<source[^>]+src=["'](https?:\/\/[^"']+\.mp4[^"']*)["']/i,
     /file\s*:\s*["']([^"']+)["']/i,
     /property=["']og:video["'][^>]*content=["']([^"']+)["']/i,
     /content=["']([^"']+)["'][^>]*property=["']og:video["']/i,
@@ -562,16 +568,51 @@ function parseYourupload(html) {
   ];
   for (var i = 0; i < pats.length; i++) {
     var m = pats[i].exec(html);
-    if (m && /^(https?:)?\/\//i.test(m[1]) && !/\.(?:jpg|jpeg|png|gif|webp)(?:\?|$)/i.test(m[1])) return m[1].replace(/&amp;/g, "&");
+    if (!m) continue;
+    var u = cleanMediaUrl(m[1]);
+    if (/^(https?:)?\/\//i.test(u) && !/\.(?:jpg|jpeg|png|gif|webp)(?:\?|$)/i.test(u)) return u;
   }
   return null;
 }
+// Algunas entradas apuntan a una pagina intermedia (go.php): busca el embed real (enlace a yourupload, meta refresh o location)
+function findYouruploadRedirect(html, baseUrl) {
+  var t = cleanMediaUrl(html);
+  var m = /(?:https?:)?\/\/(?:www\.)?yourupload\.com\/(?:embed|watch)\/[A-Za-z0-9]+/i.exec(t) ||
+    /http-equiv=["']refresh["'][^>]*content=["']\d+\s*;\s*url=([^"']+)["']/i.exec(t) ||
+    /(?:location\.href|location\.replace\(|window\.location(?:\.href)?)\s*=?\s*\(?\s*["']([^"']+)["']/i.exec(t);
+  if (!m) return null;
+  var u = (m[1] || m[0]).replace("/watch/", "/embed/");
+  if (u.indexOf("//") === 0) u = "https:" + u;
+  if (!/^https?:\/\//i.test(u)) { try { u = new URL(u, baseUrl).toString(); } catch (e) { return null; } }
+  return u;
+}
+async function fetchEmbedPage(url, headers) {
+  var resp = await fetch(url, { headers: Object.assign({ "User-Agent": UA }, headers || {}) });
+  if (!resp.ok) throw new Error("HTTP " + resp.status + " en " + url);
+  return { html: await resp.text(), url: (resp && resp.url) || url };
+}
 async function extractYourupload(embedUrl, ctx) {
-  var html = await fetchText(embedUrl, { "Referer": (ctx && ctx.referer) || AJ_BASE + "/" });
+  if (embedUrl.indexOf("//") === 0) embedUrl = "https:" + embedUrl;
+  var referer = (ctx && ctx.referer) || AJ_BASE + "/";
+  var res = await fetchEmbedPage(embedUrl, { "Referer": referer });
+  var page = res.url, html = res.html;
   var v = parseYourupload(html);
-  if (!v) { trace("embed yourupload: " + describeHtml(html)); throw new Error("No se encontro el MP4 en YourUpload"); }
+  for (var hop = 0; !v && hop < 2; hop++) {
+    var next = findYouruploadRedirect(html, page);
+    if (!next || next === page) break;
+    trace("yourupload: sigue a " + next.slice(0, 90));
+    referer = page;
+    res = await fetchEmbedPage(next, { "Referer": referer });
+    page = res.url; html = res.html;
+    v = parseYourupload(html);
+  }
+  if (!v) {
+    trace("embed yourupload: " + describeHtml(html));
+    throw new Error("No se encontro el MP4 en YourUpload (" + describeHtml(html) + ")");
+  }
   if (v.indexOf("//") === 0) v = "https:" + v;
-  return { url: v, headers: { "Referer": "https://www.yourupload.com/", "User-Agent": UA } };
+  var origin = (/^(https?:\/\/[^\/]+)/i.exec(page) || [])[1] || "https://www.yourupload.com";
+  return { url: v, headers: { "Accept": "*/*", "Referer": page, "Origin": origin, "User-Agent": UA } };
 }
 
 // Okru (ok.ru): el atributo data-options trae un JSON con "metadata" (otro JSON en texto) con hlsManifestUrl y videos[]
@@ -734,7 +775,8 @@ async function getStreams(tmdbId, type, season, episode) {
               title: "",
               url: v.url,
               quality: "\uD83D\uDCFA " + source.label + (v.tag ? " (" + v.tag + ")" : "") + "\n1080p | WEB-DL | Anime\n" +
-                (lang === "latino" ? "\uD83C\uDDF2\uD83C\uDDFD LATINO" : (lang === "castellano" ? "\uD83C\uDDEA\uD83C\uDDF8 CASTELLANO" : "\uD83C\uDDEF\uD83C\uDDF5 JAPON\u00C9S \u00B7 Sub")),
+                (lang === "latino" ? "\uD83C\uDDF2\uD83C\uDDFD LATINO" : (lang === "castellano" ? "\uD83C\uDDEA\uD83C\uDDF8 CASTELLANO" : "\uD83C\uDDEF\uD83C\uDDF5 JAPON\u00C9S \u00B7 Sub")) +
+                "\n\uD83D\uDD17 T" + seasonNum + "E" + episodeNum + " \u00B7 " + ep.url,
               headers: v.headers,
               _lang: lang,
               _rank: SERVER_ORDER.indexOf(key)
