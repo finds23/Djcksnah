@@ -6,6 +6,7 @@
  *        -> la pagina del multiplayer lista los servidores: playVideo("<embed>")
  *        -> extractor por servidor.
  */
+var CryptoJS = require("crypto-js");
 var AJ_BASE = "https://animejara.com";
 var TMDB_API_KEY = "56db0ec297530920213e1503706b81ff";
 var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -21,20 +22,20 @@ var ENABLED_SOURCES = {
   Uqload: true,      // sin probar
   Yourupload: true,  // sin probar
   Okru: true,        // sin probar
-  Filemoon: false,   // pendiente: usa un API cifrado
+  Filemoon: false,    // v1.5.0: resolvedor Byse (API cifrada AES-GCM), portado de Lamovie
   Upnshare: false    // pendiente
 };
 // Mientras se prueba el plugin: si no se encuentra nada, la lista de Nuvio muestra una entrada "DIAGNOSTICO"
 // con los pasos que se dieron. Poner en false cuando todo funcione.
-var VERSION = "1.4.2"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
-var DEBUG = false;
+var VERSION = "1.5.3"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
+var DEBUG = false; // TEMPORAL: muestra el diagnostico si algo falla. Poner en false cuando todo funcione.
 var TRACE = [];
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 140)); }
 function looksBlocked(html) {
   return /just a moment|cf-chl|challenge-platform|attention required|enable javascript and cookies/i.test(html || "");
 }
 function shortErr(e) { return String(e && e.message || e).replace(/ en https?:\/\/\S+/, ""); }
-var SERVER_ORDER = ["Streamtape", "Mp4upload", "Streamhg", "Voe", "Vidhide", "Lulustream", "Uqload", "Yourupload", "Okru"];
+var SERVER_ORDER = ["Streamtape", "Filemoon", "Mp4upload", "Streamhg", "Voe", "Vidhide", "Lulustream", "Uqload", "Yourupload", "Okru"];
 
 // ---------- utilidades ----------
 function norm(s) {
@@ -294,13 +295,57 @@ async function getEpisode(slug, season, episode) {
 }
 
 // ---------- lista de servidores del multiplayer ----------
+function hostName(u) {
+  var h = hostOf(u).toLowerCase();
+  if (/hgcloud|hglink|streamhg|streamwish|vibuxer|premilkyway/.test(h)) return "streamhg";
+  if (/filemoon|byse|moonplayer/.test(h)) return "filemoon";
+  if (/uqload/.test(h)) return "uqload";
+  if (/streamtape|tape/.test(h)) return "streamtape";
+  if (/mp4upload/.test(h)) return "mp4upload";
+  if (/voe/.test(h)) return "voe";
+  if (/vidhide|vidhidepro|dintezuvio/.test(h)) return "vidhide";
+  if (/lulu/.test(h)) return "lulustream";
+  if (/yourupload/.test(h)) return "yourupload";
+  if (/ok\.ru/.test(h)) return "okru";
+  return "?";
+}
 async function getServers(embedPageUrl, referer) {
   var html = await fetchText(embedPageUrl, { "Referer": referer });
   var re = /<li\b[^>]*?onclick=["'][^"']*?playVideo\(\s*(?:&quot;|&#34;|'|\\")(https?:[^"'\\]+?)(?:&quot;|&#34;|'|\\")\s*\)[^"']*["'][^>]*>([\s\S]*?)<\/li>/gi;
-  var out = [], m;
+  var out = [], seen = {}, m;
   while ((m = re.exec(html)) !== null) {
     var nm = /nombre-server["']?>\s*([^<]+?)\s*</i.exec(m[2]) || /alt=["']([^"']+)["']/i.exec(m[2]);
-    out.push({ name: nm ? nm[1].trim() : "?", url: decodeEntities(m[1]) });
+    var u0 = decodeEntities(m[1]);
+    if (seen[u0]) continue;
+    seen[u0] = true;
+    out.push({ name: nm ? nm[1].trim() : hostName(u0), url: u0 });
+  }
+  var calls = (html.match(/playVideo\(/g) || []).length;
+  if (out.length < calls) {
+    // Lector tolerante: cualquier playVideo(<url>) aunque el <li> tenga otro formato
+    var lre = /playVideo\(([\s\S]{0,400}?)\)/g, lm;
+    while ((lm = lre.exec(html)) !== null) {
+      var arg = decodeEntities(lm[1]).replace(/\\\//g, "/");
+      var um = /((?:https?:)?\/\/[^"'\s\\)]+)/.exec(arg);
+      if (!um) continue;
+      var u = um[1].indexOf("//") === 0 ? "https:" + um[1] : um[1];
+      if (seen[u]) continue;
+      seen[u] = true;
+      var after = html.slice(lm.index, lm.index + 500);
+      var nn = /nombre-server["']?>\s*([^<]+?)\s*</i.exec(after) || /alt=["']([^"']+)["']/i.exec(after);
+      var hn = hostName(u);
+      out.push({ name: hn !== "?" ? hn : (nn ? nn[1].trim() : "?"), url: u });
+    }
+  }
+  trace("multiplayer: " + html.length + "b, <li=" + (html.match(/<li\b/g) || []).length + ", playVideo=" + calls + ", leidos=" + out.length);
+  if (calls > 0 && out.length < Math.max(2, calls)) {
+    var i0 = html.indexOf("playVideo(");
+    var flat = html.slice(Math.max(0, i0 - 120), i0 + 480).replace(/\s+/g, " ");
+    trace("mp html1: " + flat.slice(0, 135)); trace("mp html2: " + flat.slice(135, 270)); trace("mp html3: " + flat.slice(270, 405));
+  }
+  if (calls === 0) {
+    var f2 = html.replace(/\s+/g, " ");
+    trace("mp sin playVideo: " + f2.slice(0, 135)); trace("mp b: " + f2.slice(135, 270));
   }
   return out;
 }
@@ -325,7 +370,7 @@ function unpackPacker(src) {
 function describeHtml(html) {
   var t = /<title[^>]*>([^<]*)/i.exec(html || "");
   return (html || "").length + "b" +
-    ", packer=" + (/eval\(function\(p,a,c,k,e,d\)/.test(html) ? "si" : "no") +
+    ", packer=" + (/eval\(function\(p,a,c,k,e,[a-z]\)/.test(html) ? "si" : "no") +
     ", m3u8=" + (/m3u8/.test(html) ? "si" : "no") +
     ", links=" + (/var\s+links\s*=/.test(html) ? "si" : "no") +
     ", sources=" + (/sources\s*:/.test(html) ? "si" : "no") +
@@ -334,7 +379,7 @@ function describeHtml(html) {
 }
 function extractHlsFromHtml(html) {
   var texts = [html];
-  var re = /eval\(function\(p,a,c,k,e,d\)[\s\S]*?\.split\(\s*['"]\|['"]\s*\)[^\n]*?\)\)/g, m;
+  var re = /eval\(function\(p,a,c,k,e,[a-z]\)[\s\S]*?\.split\(\s*['"]\|['"]\s*\)[^\n]*?\)\)/g, m;
   while ((m = re.exec(html)) !== null) {
     try {
       var u = unpackPacker(m[0]);
@@ -471,8 +516,19 @@ function extractStreamtapeFromHtml(html) {
   return url + "&stream=1";
 }
 async function extractStreamtape(embedUrl, ctx) {
-  var html = await fetchText(embedUrl, { "Referer": (ctx && ctx.referer) || AJ_BASE + "/" });
-  var url = extractStreamtapeFromHtml(html);
+  if (embedUrl.indexOf("//") === 0) embedUrl = "https:" + embedUrl;
+  var ref = (ctx && ctx.referer) || AJ_BASE + "/";
+  var sid = embedId(embedUrl);
+  var cands = [embedUrl, "https://streamtape.com/e/" + sid, "https://streamtape.com/v/" + sid, "https://streamtape.net/e/" + sid, "https://streamtape.to/e/" + sid];
+  var html = "", url = null, lastErr = null;
+  for (var ci = 0; ci < cands.length && !url; ci++) {
+    if (cands.indexOf(cands[ci]) !== ci) continue;
+    try {
+      html = await fetchText(cands[ci], { "Referer": ref });
+      url = extractStreamtapeFromHtml(html);
+    } catch (e) { lastErr = e; }
+  }
+  if (!url && lastErr && !html) throw lastErr;
   if (!url) { trace("embed streamtape: " + describeHtml(html) + ", robotlink=" + (/robotlink|botlink/.test(html) ? "si" : "no")); throw new Error("No se encontro el enlace en el embed de Streamtape"); }
   return { url: url, headers: { "Referer": "https://streamtape.com/", "User-Agent": UA } };
 }
@@ -541,11 +597,15 @@ async function extractVoe(embedUrl, ctx) {
 }
 
 async function extractUqload(embedUrl, ctx) {
-  var html = await fetchText(embedUrl, { "Referer": (ctx && ctx.referer) || AJ_BASE + "/" });
+  if (embedUrl.indexOf("//") === 0) embedUrl = "https:" + embedUrl;
+  if (!/\/embed-/.test(embedUrl)) embedUrl = embedUrl.replace(/(https?:\/\/[^\/]+\/)/, "$1embed-").replace(/\.html$/, "") + ".html";
+  var html = await fetchText(embedUrl, { "Referer": ajOrigin(embedUrl) + "/" });
   var m = /sources\s*:\s*\[\s*["']([^"']+)["']/.exec(html) || /file\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/.exec(html);
-  if (!m) { trace("embed uqload: " + describeHtml(html)); throw new Error("No se encontro la fuente en Uqload"); }
+  var v = m ? m[1] : extractHlsFromHtml(html); // v1.5.2: Uqload ahora entrega el m3u8 dentro de un script empaquetado
+  if (!v) { trace("embed uqload: " + describeHtml(html)); throw new Error("No se encontro la fuente en Uqload"); }
   var origin = new URL(embedUrl).origin;
-  var v = m[1];
+  v = String(v).replace(/\\\//g, "/");
+  if (v.charAt(0) === "/" && v.charAt(1) !== "/") v = origin + v;
   if (v.indexOf("//") === 0) v = "https:" + v;
   var o = { url: v, headers: { "Referer": origin + "/", "User-Agent": UA } };
   if (/\.m3u8/.test(v)) o.type = "hls";
@@ -660,10 +720,98 @@ async function extractOkru(embedUrl, ctx) {
   });
 }
 
+
+// ---------- v1.5.0: StreamHG con varios referers y dominios espejo ----------
+function ajOrigin(u) { var m = /^(https?:\/\/[^\/?#]+)/i.exec(u || ""); return m ? m[1] : ""; }
+async function packedOnce(url, referer) {
+  var resp = await fetch(url, { headers: { "User-Agent": MOBILE_UA, "Referer": referer, "Accept": "text/html,*/*;q=0.8", "Accept-Language": "es-419,es;q=0.9" } });
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  var html = await resp.text();
+  var finalUrl = resp.url || url;
+  var v = extractHlsFromHtml(html);
+  if (!v) {
+    var nxt = findJsRedirect(html, finalUrl);
+    if (nxt && nxt !== finalUrl) {
+      var r2 = await fetch(nxt, { headers: { "User-Agent": MOBILE_UA, "Referer": finalUrl } });
+      if (r2.ok) { html = await r2.text(); finalUrl = r2.url || nxt; v = extractHlsFromHtml(html); }
+    }
+  }
+  return { url: v, html: html, page: finalUrl };
+}
+async function extractStreamhg(embedUrl, ctx) {
+  if (embedUrl.indexOf("//") === 0) embedUrl = "https:" + embedUrl;
+  var id = embedUrl.replace(/[?#].*$/, "").split("/").filter(Boolean).pop().replace(/\.html$/, "");
+  var own = ajOrigin(embedUrl) + "/";
+  var multi = (ctx && ctx.referer) || AJ_BASE + "/";
+  var tries = [];
+  [own, multi, AJ_BASE + "/"].forEach(function (r) { tries.push({ u: embedUrl, r: r }); });
+  ["https://hglink.to/e/", "https://streamwish.to/e/", "https://vibuxer.com/e/", "https://hgcloud.to/e/"].forEach(function (b) {
+    if (ajOrigin(b + id) !== ajOrigin(embedUrl)) tries.push({ u: b + id, r: ajOrigin(b) + "/" });
+  });
+  var last = null;
+  for (var i = 0; i < tries.length; i++) {
+    try {
+      var res = await packedOnce(tries[i].u, tries[i].r);
+      last = res;
+      if (res.url) {
+        var u = String(res.url).replace(/\\\//g, "/");
+        var origin = ajOrigin(res.page) || "https://hgcloud.to";
+        if (u.indexOf("//") === 0) u = "https:" + u; else if (u.charAt(0) === "/") u = origin + u;
+        return { url: u, type: /\.mp4/.test(u) ? undefined : "hls", headers: { "Referer": origin + "/", "Origin": origin, "User-Agent": MOBILE_UA } };
+      }
+    } catch (e) { trace("streamhg " + hostOf(tries[i].u) + ": " + shortErr(e)); }
+  }
+  if (last) {
+    trace("streamhg embed " + hostOf(last.page) + ": " + describeHtml(last.html));
+    var flat = last.html.replace(/\s+/g, " ");
+    if (last.html.length < 4000) trace("cuerpo: " + flat.slice(0, 260)); else trace("inicio: " + flat.slice(0, 200));
+  }
+  throw new Error("No se encontro la URL HLS en el embed");
+}
+
+// ---------- v1.5.0: Filemoon / Byse (API cifrada AES-GCM) ----------
+function b64uWords(t) {
+  var b = String(t || "").replace(/-/g, "+").replace(/_/g, "/");
+  while (b.length % 4) b += "=";
+  return CryptoJS.enc.Base64.parse(b);
+}
+async function getJson(url, headers) {
+  var r = await fetch(url, { headers: Object.assign({ "User-Agent": UA }, headers || {}) });
+  if (!r.ok) throw new Error("HTTP " + r.status + " en " + hostOf(url));
+  return r.json();
+}
+function embedId(u) {
+  var clean = String(u).replace(/[?#].*$/, "");
+  var m = /\/(?:e|d|v|embed)\/([A-Za-z0-9_-]+)/.exec(clean);
+  return m ? m[1] : clean.replace(/\/+$/, "").split("/").pop();
+}
+async function extractFilemoon(embedUrl, ctx) {
+  if (embedUrl.indexOf("//") === 0) embedUrl = "https:" + embedUrl;
+  var base = ajOrigin(embedUrl);
+  var code = embedId(embedUrl);
+  var det = await getJson(base + "/api/videos/" + code + "/embed/details", { "Referer": embedUrl, "X-Requested-With": "XMLHttpRequest" });
+  var frame = det && det.embed_frame_url;
+  if (!frame) throw new Error("Filemoon: sin embed_frame_url");
+  var fbase = ajOrigin(frame);
+  var fcode = embedId(frame);
+  var play = await getJson(fbase + "/api/videos/" + fcode + "/embed/playback", { "Accept": "*/*", "Referer": frame, "X-Embed-Parent": embedUrl, "Accept-Language": "en-US,en;q=0.5" });
+  var p = play && play.playback;
+  if (!p || !p.key_parts || !p.payload || !p.iv) throw new Error("Filemoon: playback sin datos");
+  var key = b64uWords(p.key_parts[0]).concat(b64uWords(p.key_parts[1]));
+  var clear = CryptoJS.AES.decrypt({ ciphertext: b64uWords(p.payload) }, key, { iv: b64uWords(p.iv), mode: CryptoJS.mode.GCM, padding: CryptoJS.pad.NoPadding }).toString(CryptoJS.enc.Utf8);
+  var data = JSON.parse(clear.replace(/^\uFEFF/, ""));
+  var src = data.sources && data.sources[0];
+  if (!src || !src.url) throw new Error("Filemoon: sin fuente");
+  var o = { url: src.url, headers: { "Referer": base + "/", "User-Agent": UA } };
+  if (/\.m3u8/.test(src.url)) o.type = "hls";
+  return o;
+}
+
 var EXTRACTORS = {
   Streamtape: { label: "Streamtape", extract: extractStreamtape },
   Mp4upload: { label: "MP4Upload", extract: extractMp4upload },
-  Streamhg: { label: "StreamHG", extract: extractPackedHls },
+  Streamhg: { label: "StreamHG", extract: extractStreamhg },
+  Filemoon: { label: "Filemoon", extract: extractFilemoon },
   Voe: { label: "VOE", extract: extractVoe },
   Vidhide: { label: "Vidhide", extract: extractVidhide },
   Lulustream: { label: "Lulustream", extract: extractPackedHls },
@@ -671,9 +819,15 @@ var EXTRACTORS = {
   Yourupload: { label: "YourUpload", extract: extractYourupload },
   Okru: { label: "Okru", extract: extractOkru }
 };
-function findSourceKey(serverName) {
+function findSourceKey(serverName, serverUrl) {
+  var enabled = Object.keys(EXTRACTORS).filter(function (k) { return ENABLED_SOURCES[k]; });
   var n = norm(serverName).replace(/[^a-z0-9]/g, ""); // "ok.ru" -> "okru"
-  return Object.keys(EXTRACTORS).filter(function (k) { return ENABLED_SOURCES[k]; }).find(function (k) { return n.indexOf(k.toLowerCase()) !== -1; });
+  var key = enabled.find(function (k) { return n.indexOf(k.toLowerCase()) !== -1; });
+  if (!key && serverUrl) {
+    var hn = hostName(serverUrl);
+    key = enabled.find(function (k) { return k.toLowerCase() === hn; });
+  }
+  return key;
 }
 
 // ---------- punto de entrada ----------
@@ -685,16 +839,24 @@ async function getStreams(tmdbId, type, season, episode) {
   try {
     var seasonNum = season ? Number(season) : 1;
     var episodeNum = episode !== undefined ? Number(episode) : 1;
-    var info = await getTMDBInfo(tmdbId);
-    if (!info) { trace("TMDB fallo"); return diagnostic(); }
-    trace("TMDB: " + info.titles.slice(0, 2).join(" / ") + " (" + info.year + ") T" + seasonNum + "E" + episodeNum);
-    if (!info.isAnime) {
-      trace("descartado: no parece anime (animacion + pais asiatico)");
-      console.log("[AnimeJara] Descartado (no parece anime): " + (info.titles[0] || tmdbId));
-      return diagnostic();
+    // Modo directo: el catalogo del addon manda "slug:<slug>" y se salta TMDB
+    var directSlug = /^slug:([a-z0-9][a-z0-9\-]*)$/i.exec(String(tmdbId));
+    var slugs;
+    if (directSlug) {
+      slugs = [directSlug[1].toLowerCase()];
+      trace("slug directo: " + slugs[0] + " T" + seasonNum + "E" + episodeNum);
+    } else {
+      var info = await getTMDBInfo(tmdbId);
+      if (!info) { trace("TMDB fallo"); return diagnostic(); }
+      trace("TMDB: " + info.titles.slice(0, 2).join(" / ") + " (" + info.year + ") T" + seasonNum + "E" + episodeNum);
+      if (!info.isAnime) {
+        trace("descartado: no parece anime (animacion + pais asiatico)");
+        console.log("[AnimeJara] Descartado (no parece anime): " + (info.titles[0] || tmdbId));
+        return diagnostic();
+      }
+      var extra = await getExtraTitles(info.titles);
+      slugs = await slugCandidates(info.titles, info.year, extra);
     }
-    var extra = await getExtraTitles(info.titles);
-    var slugs = await slugCandidates(info.titles, info.year, extra);
     console.log("[AnimeJara] Candidatos de slug: " + slugs.join(", ") + " | T" + seasonNum + "E" + episodeNum);
 
     var ep = null, usedSlug = null;
@@ -763,7 +925,7 @@ async function getStreams(tmdbId, type, season, episode) {
       trace(lang + ": " + servers.length + " servidores" + (servers.length ? " (" + servers.map(function (x) { return x.name; }).join(",") + ")" : ""));
       console.log("[AnimeJara] " + lang + " servidores: " + servers.map(function (s) { return s.name; }).join(", "));
       var jobs = servers.map(async function (server) {
-        var key = findSourceKey(server.name);
+        var key = findSourceKey(server.name, server.url);
         if (!key) return null;
         var source = EXTRACTORS[key];
         try {
